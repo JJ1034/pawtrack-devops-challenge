@@ -1,32 +1,229 @@
-name: Deploy Infrastructure
+name: Deploy
 
 on:
   push:
-    branches:
-      - main
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Pin one in-flight deploy at a time per ref. PRs can preempt their
+# own previous plans, but main runs queue.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  AWS_REGION: us-east-1
+  TF_VERSION: 1.14.9
+  TERRAFORM_WORKDIR: terraform
+
+permissions:
+  contents: read
+  id-token: write       # required for OIDC -> AWS
+  pull-requests: write  # required to post the plan as a PR comment
 
 jobs:
-  deploy:
+  # ---------------------------------------------------------------------
+  # Static checks: fmt + validate run on everything, including PRs.
+  # ---------------------------------------------------------------------
+  static:
+    name: Terraform fmt + validate
     runs-on: ubuntu-latest
-
-    env:
-      AWS_ACCESS_KEY_ID: AKIAIOSFODNN7EXAMPLE
-      AWS_SECRET_ACCESS_KEY: wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY
-      AWS_DEFAULT_REGION: us-east-1
-
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v3
         with:
-          terraform_version: 1.5.0
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
 
-      - name: Terraform Init
-        working-directory: terraform
+      - name: terraform fmt -check
+        working-directory: ${{ env.TERRAFORM_WORKDIR }}
+        run: terraform fmt -check -recursive
+
+      - name: terraform init -backend=false
+        working-directory: ${{ env.TERRAFORM_WORKDIR }}
+        run: terraform init -backend=false
+
+      - name: terraform validate
+        working-directory: ${{ env.TERRAFORM_WORKDIR }}
+        run: terraform validate
+
+  # ---------------------------------------------------------------------
+  # PR plan: read-only AWS role, posts the plan as a comment so reviewers
+  # see the diff before merging.
+  # ---------------------------------------------------------------------
+  plan:
+    name: Terraform plan
+    if: github.event_name == 'pull_request'
+    needs: static
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (read-only)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+
+      - name: terraform init
+        working-directory: ${{ env.TERRAFORM_WORKDIR }}
         run: terraform init
 
-      - name: Terraform Apply
-        working-directory: terraform
-        run: terraform apply -auto-approve
+      - name: terraform plan
+        id: plan
+        working-directory: ${{ env.TERRAFORM_WORKDIR }}
+        run: |
+          terraform plan \
+            -var "image_tag=${{ github.sha }}" \
+            -no-color -out=tfplan
+          terraform show -no-color tfplan > plan.txt
+
+      - name: Comment plan on PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const plan = fs.readFileSync('${{ env.TERRAFORM_WORKDIR }}/plan.txt', 'utf8');
+            const truncated = plan.length > 60000
+              ? plan.slice(0, 60000) + '\n\n... (plan truncated; see workflow logs)'
+              : plan;
+            const body = `### Terraform plan\n\n<details><summary>Show plan</summary>\n\n\`\`\`hcl\n${truncated}\n\`\`\`\n\n</details>`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+  # ---------------------------------------------------------------------
+  # Build + push the application image to ECR with the immutable git SHA
+  # as the tag. Runs only on push to main so PRs don't pollute ECR.
+  # ---------------------------------------------------------------------
+  build:
+    name: Build and push image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: static
+    runs-on: ubuntu-latest
+    outputs:
+      image_tag: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Resolve ECR repository URI
+        id: repo
+        run: |
+          REPO_URI="${{ steps.ecr.outputs.registry }}/pawtrack-api"
+          echo "uri=$REPO_URI" >> "$GITHUB_OUTPUT"
+
+      # Skip the push if this exact SHA is already in ECR (e.g. re-run of
+      # a green workflow). ECR is set to IMMUTABLE so we cannot overwrite.
+      - name: Check if image already exists
+        id: exists
+        run: |
+          if aws ecr describe-images \
+                --repository-name pawtrack-api \
+                --image-ids imageTag=${{ github.sha }} >/dev/null 2>&1; then
+            echo "already=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "already=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Set up Docker Buildx
+        if: steps.exists.outputs.already == 'false'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        if: steps.exists.outputs.already == 'false'
+        uses: docker/build-push-action@v5
+        with:
+          context: ./app
+          push: true
+          tags: ${{ steps.repo.outputs.uri }}:${{ github.sha }}
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # ---------------------------------------------------------------------
+  # Apply: protected by the `production` GitHub environment so a human
+  # has to approve before infrastructure or task definitions change.
+  # ---------------------------------------------------------------------
+  apply:
+    name: Terraform apply
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: http://${{ steps.outputs.outputs.alb_dns_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: terraform init
+        working-directory: ${{ env.TERRAFORM_WORKDIR }}
+        run: terraform init
+
+      - name: terraform apply
+        working-directory: ${{ env.TERRAFORM_WORKDIR }}
+        run: |
+          terraform apply -auto-approve \
+            -var "image_tag=${{ github.sha }}"
+
+      - name: Capture outputs
+        id: outputs
+        working-directory: ${{ env.TERRAFORM_WORKDIR }}
+        run: |
+          {
+            echo "alb_dns_name=$(terraform output -raw alb_dns_name)"
+            echo "cluster=$(terraform output -raw ecs_cluster_name)"
+            echo "service=$(terraform output -raw ecs_service_name)"
+          } >> "$GITHUB_OUTPUT"
+
+      # Block the workflow until ECS reports the new task definition is
+      # stable. Combined with the deployment circuit breaker, a failed
+      # rollout fails the workflow instead of silently leaving the old
+      # tasks running while the deploy goes red.
+      - name: Wait for ECS deployment to stabilize
+        run: |
+          aws ecs wait services-stable \
+            --cluster ${{ steps.outputs.outputs.cluster }} \
+            --services ${{ steps.outputs.outputs.service }}
+
+      - name: Smoke test /health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS "http://${{ steps.outputs.outputs.alb_dns_name }}/health" >/dev/null; then
+              echo "Health check passed"
+              exit 0
+            fi
+            echo "Attempt $i: not healthy yet, retrying..."
+            sleep 10
+          done
+          echo "Health check never passed"
+          exit 1
