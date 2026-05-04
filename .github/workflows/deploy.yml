@@ -55,7 +55,12 @@ jobs:
   # ---------------------------------------------------------------------
   plan:
     name: Terraform plan
-    if: github.event_name == 'pull_request'
+    # Skip cleanly when no plan role is configured (e.g. a fresh fork that
+    # hasn't been wired to AWS yet) instead of hard-failing the PR check.
+    # Role ARNs are not secret — they're identifiers gated by the OIDC
+    # trust policy on the AWS side — so they live in `vars`, which can
+    # be referenced from `if:` (secrets cannot).
+    if: github.event_name == 'pull_request' && vars.AWS_PLAN_ROLE_ARN != ''
     needs: static
     runs-on: ubuntu-latest
     steps:
@@ -64,7 +69,7 @@ jobs:
       - name: Configure AWS credentials (read-only)
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_PLAN_ROLE_ARN }}
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - uses: hashicorp/setup-terraform@v3
@@ -107,7 +112,7 @@ jobs:
   # ---------------------------------------------------------------------
   build:
     name: Build and push image
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AWS_DEPLOY_ROLE_ARN != ''
     needs: static
     runs-on: ubuntu-latest
     outputs:
@@ -118,7 +123,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to ECR
@@ -165,7 +170,7 @@ jobs:
   # ---------------------------------------------------------------------
   apply:
     name: Terraform apply
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.AWS_DEPLOY_ROLE_ARN != ''
     needs: build
     runs-on: ubuntu-latest
     environment:
@@ -177,7 +182,7 @@ jobs:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
         with:
-          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ env.AWS_REGION }}
 
       - uses: hashicorp/setup-terraform@v3
